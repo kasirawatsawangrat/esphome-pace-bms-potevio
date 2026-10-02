@@ -7,12 +7,14 @@
 #include <vector>
 #include <span>
 #include <optional>
+#include <map>
 
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 
 #include "pace_bms_protocol_v25.h"
 #include "pace_bms_protocol_v20.h"
+#include "pace_bms_dc_protocol.h"
 
 namespace esphome {
 namespace pace_bms_base {
@@ -34,11 +36,66 @@ public:
 	BmsType get_bms_type() const { return this->bms_type_; }
 	uint8_t get_address() const { return this->address_; }
 
+	// Multiple sensor/number/switch subscribers share one F5 read per pack and parameter.
+	void register_dc_parameter_callback_v25(uint8_t parameter, std::function<void(float)> callback) {
+		if (PaceBmsDcProtocol::IsSupportedParameter(parameter))
+			dc_parameter_callbacks_[parameter].push_back(std::move(callback));
+	}
+	bool needs_dc_parameter_v25(uint8_t parameter) const {
+		auto found = dc_parameter_callbacks_.find(parameter);
+		return found != dc_parameter_callbacks_.end() && !found->second.empty();
+	}
+	bool has_dc_parameter_value_v25(uint8_t parameter) const { return dc_parameter_values_.count(parameter) != 0; }
+	void publish_dc_parameter_v25(uint8_t parameter, uint16_t raw) {
+		dc_parameter_values_[parameter] = raw;
+		auto found = dc_parameter_callbacks_.find(parameter);
+		if (found != dc_parameter_callbacks_.end())
+			for (const auto& callback : found->second) callback(raw / PaceBmsDcProtocol::ValueScale(parameter));
+	}
+	virtual void write_equalized_charging_current_v25(float amperes) = 0;
+	virtual void write_dc_parameter_v25(uint8_t parameter, float value) = 0;
+	void register_online_callback(std::function<void(bool)> callback, uint32_t offline_timeout_ms, uint32_t now = 0) {
+		online_callbacks_.push_back(std::move(callback));
+		offline_timeout_ms_ = offline_timeout_ms;
+		online_monitor_started_ms_ = now;
+	}
+	bool needs_online_probe() const { return !online_callbacks_.empty(); }
+	void notify_online_probe_success(uint32_t now) {
+		last_online_success_ms_ = now;
+		has_online_success_ = true;
+		if (!has_online_state_ || !online_state_) publish_online_state_(true);
+	}
+	void notify_online_probe_failure(uint32_t now) {
+		if (!has_online_success_ || now - last_online_success_ms_ >= offline_timeout_ms_)
+			if (!has_online_state_ || online_state_) publish_online_state_(false);
+	}
+
+	void check_online_timeout(uint32_t now) {
+		if (!needs_online_probe()) return;
+		const uint32_t reference = has_online_success_ ? last_online_success_ms_ : online_monitor_started_ms_;
+		if (now - reference >= offline_timeout_ms_)
+			if (!has_online_state_ || online_state_) publish_online_state_(false);
+	}
+
 protected:
 	// config values set in YAML
 	std::string id_name_;
 	BmsType bms_type_;
 	uint8_t address_{ 0 };
+	std::map<uint8_t, std::vector<std::function<void(float)>>> dc_parameter_callbacks_;
+	std::map<uint8_t, uint16_t> dc_parameter_values_;
+	std::vector<std::function<void(bool)>> online_callbacks_;
+	uint32_t offline_timeout_ms_{15000};
+	uint32_t last_online_success_ms_{0};
+	uint32_t online_monitor_started_ms_{0};
+	bool has_online_success_{false};
+	bool has_online_state_{false};
+	bool online_state_{false};
+	void publish_online_state_(bool online) {
+		has_online_state_ = true;
+		online_state_ = online;
+		for (const auto& callback : online_callbacks_) callback(online);
+	}
 
 public:
 	// make accessible to sensors

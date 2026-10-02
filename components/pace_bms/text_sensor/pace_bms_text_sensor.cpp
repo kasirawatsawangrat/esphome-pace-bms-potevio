@@ -50,15 +50,12 @@ void PaceBmsTextSensor::setup() {
 			}
 		}
 		if (this->serial_number_sensor_ != nullptr) {
-			if(this->parent_->get_bms_type() == BMS_TYPE_MASTER) {
-				this->parent_->register_serial_number_callback_v25([this](std::string& serial_number) {
-					if (this->serial_number_sensor_ != nullptr) {
-						this->parent_->queue_sensor_update([this, value = serial_number]() { this->serial_number_sensor_->publish_state(value); });
-					}
-				});
-			} else {
-				ESP_LOGE(TAG, "Serial Number readout only supported for type=MASTER");
-			}
+			// YAML validation restricts slave serial-number entities to DIRECT mode.
+			this->parent_->register_serial_number_callback_v25([this](std::string& serial_number) {
+				if (this->serial_number_sensor_ != nullptr) {
+					this->parent_->queue_sensor_update([this, value = serial_number]() { this->serial_number_sensor_->publish_state(value); });
+				}
+			});
 		}
 	}
 	else if (this->parent_->get_protocol_commandset() == 0x20) {

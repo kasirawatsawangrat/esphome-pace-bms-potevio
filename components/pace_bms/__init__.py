@@ -14,6 +14,7 @@ from esphome.const import (
     CONF_NUMBER,
     CONF_SENSOR,
     CONF_SWITCH,
+    CONF_BINARY_SENSOR,
 
     CONF_PLATFORM,
     CONF_NAME,
@@ -95,6 +96,7 @@ BmsType = pace_bms_master_ns.enum("SlaveQueryMode")
 SLAVE_QUERY_MODE = {
     "BROADCAST": BmsType.SLAVE_QUERY_MODE_BROADCAST,
     "RELAY": BmsType.SLAVE_QUERY_MODE_RELAY,
+    "DIRECT": BmsType.SLAVE_QUERY_MODE_DIRECT,
 }
 
 
@@ -179,8 +181,21 @@ CONFIG_SCHEMA = cv.All(
 
 def final_validate_master_bms_schema(master_config):
 
+    if (master_config.get(CONF_SLAVE_QUERY_MODE) == "DIRECT" and
+            master_config.get(CONF_PROTOCOL_COMMANDSET) != 0x25):
+        raise cv.Invalid("slave_query_mode DIRECT requires protocol_commandset 0x25.")
+
     full_config = fv.full_config.get()
     master_id = master_config.get(CONF_ID)
+
+    for domain in (CONF_SENSOR, CONF_NUMBER, CONF_SWITCH, CONF_BINARY_SENSOR):
+        for entity_config in full_config.get(domain, []):
+            if (entity_config.get(CONF_PLATFORM) == CONF_PACE_BMS and
+                    entity_config.get(CONF_PACE_BMS_ID) == master_id and
+                    any(key in entity_config for key in ("bus_current", "equalized_charging_current", "online",
+                        "discharge_power", "charge_power", "discharge_current_limiting", "charge_current_limiting")) and
+                    master_config.get(CONF_PROTOCOL_COMMANDSET) != 0x25):
+                raise cv.Invalid("DC control entities require protocol_commandset 0x25.")
 
     # ensure unique addresses across all pace_bms instances
     address_to_id_name = {}
@@ -271,12 +286,17 @@ def final_validate_slave_bms_schema(slave_config):
                 # we now know that this is the platform for the slave we are validating, now check for invalid components when BMS type is slave
                 # don't want to check each individual number here, so just check for any child components at all
                 for index, (key, value) in enumerate(number_platform.items()):
+                    if key in ("bus_current", "equalized_charging_current", "discharge_power", "charge_power"):
+                        if (master_pace_bms_schema is None or
+                                master_pace_bms_schema.get(CONF_SLAVE_QUERY_MODE) != "DIRECT"):
+                            raise cv.Invalid("Slave DC number requires slave_query_mode DIRECT.")
+                        continue
                     if isinstance(value, dict):
                         name = value.get(CONF_NAME)
                         if(name is not None):
-                            raise cv.Invalid(f"The '{name}' number is not available for a BMS with type=SLAVE. No numbers components are valid for SLAVE BMSes.")
+                            raise cv.Invalid(f"The '{name}' number is not available for a BMS with type=SLAVE. Only DC current/power numbers in DIRECT mode are supported.")
                         else:
-                            raise cv.Invalid(f"The '<unnamed>' number is not available for a BMS with type=SLAVE. No numbers components are valid for SLAVE BMSes.")
+                            raise cv.Invalid(f"The '<unnamed>' number is not available for a BMS with type=SLAVE. Only DC current/power numbers in DIRECT mode are supported.")
 
     # check for invalid select components when BMS type is slave
     select_platforms = full_config.get(CONF_SELECT)
@@ -305,11 +325,27 @@ def final_validate_slave_bms_schema(slave_config):
                     raise cv.Invalid(f"The '{CONF_BMS_COUNT}' sensor is not available for a BMS with type=SLAVE.")
                 if CONF_PAYLOAD_COUNT in sensor_platform:
                     raise cv.Invalid(f"The '{CONF_PAYLOAD_COUNT}' sensor is not available for a BMS with type=SLAVE.")
+                if any(key in sensor_platform for key in ("bus_current", "equalized_charging_current")):
+                    if (master_pace_bms_schema is None or
+                            master_pace_bms_schema.get(CONF_SLAVE_QUERY_MODE) != "DIRECT"):
+                        raise cv.Invalid("Slave DC current sensors require slave_query_mode DIRECT.")
 
-    # check for invalid switch components when BMS type is slave
-    # the switches just go read-only for slaves, nothing to exclude
-    #switch_platforms = full_config.get(CONF_SWITCH)
-    #if(switch_platforms is not None):
+    # Legacy switches remain read-only on slaves; the new DC switches require DIRECT.
+    for switch_platform in full_config.get(CONF_SWITCH, []):
+        if (switch_platform.get(CONF_PLATFORM) == CONF_PACE_BMS and
+                switch_platform.get(CONF_PACE_BMS_ID) == slave_id and
+                any(key in switch_platform for key in ("discharge_current_limiting", "charge_current_limiting"))):
+            if (master_pace_bms_schema is None or
+                    master_pace_bms_schema.get(CONF_SLAVE_QUERY_MODE) != "DIRECT"):
+                raise cv.Invalid("Slave DC limiting switches require slave_query_mode DIRECT.")
+
+    for binary_sensor_platform in full_config.get(CONF_BINARY_SENSOR, []):
+        if (binary_sensor_platform.get(CONF_PLATFORM) == CONF_PACE_BMS and
+                binary_sensor_platform.get(CONF_PACE_BMS_ID) == slave_id and
+                "online" in binary_sensor_platform):
+            if (master_pace_bms_schema is None or
+                    master_pace_bms_schema.get(CONF_SLAVE_QUERY_MODE) != "DIRECT"):
+                raise cv.Invalid("Slave online binary sensor requires slave_query_mode DIRECT.")
 
     # check for invalid text_sensor components when BMS type is slave
     text_sensor_platforms = full_config.get(CONF_TEXT_SENSOR)
@@ -322,7 +358,9 @@ def final_validate_slave_bms_schema(slave_config):
                 if CONF_HARDWARE_VERSION in text_sensor_platform:
                     raise cv.Invalid(f"The '{CONF_HARDWARE_VERSION}' text_sensor is not available for a BMS with type=SLAVE.")
                 if CONF_SERIAL_NUMBER in text_sensor_platform:
-                    raise cv.Invalid(f"The '{CONF_SERIAL_NUMBER}' text_sensor is not available for a BMS with type=SLAVE.")
+                    if (master_pace_bms_schema is None or
+                            master_pace_bms_schema.get(CONF_SLAVE_QUERY_MODE) != "DIRECT"):
+                        raise cv.Invalid(f"The '{CONF_SERIAL_NUMBER}' text_sensor for type=SLAVE requires slave_query_mode DIRECT on its master.")
 
     return slave_config
 

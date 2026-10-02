@@ -19,6 +19,8 @@ class PaceBmsSlave : public pace_bms_base::PaceBmsBase, public Component {
 public:
 
 	void set_parent(pace_bms_master::PaceBmsMaster* parent) { parent_ = parent; }
+	void write_equalized_charging_current_v25(float amperes) override;
+	void write_dc_parameter_v25(uint8_t parameter, float value) override;
 
 	// standard overrides to implement component behavior
 	void dump_config() override;
@@ -40,9 +42,11 @@ public:
 	// design such as having slaves (or itself) process the payloads internally via a method such as "notify_analog_information" for example
 	std::vector<std::function<void(PaceBmsProtocolV25::AnalogInformation&)>> get_analog_information_callbacks_v25() override { return analog_information_callbacks_v25_; };
 	std::vector<std::function<void(PaceBmsProtocolV25::StatusInformation&)>> get_status_information_callbacks_v25() override { return status_information_callbacks_v25_; };
+	const std::vector<std::function<void(std::string&)>>& get_serial_number_callbacks_v25() const { return serial_number_callbacks_v25_; }
 
 	// child sensors call these to register for notification upon reciept of various types of data from the BMS, in the case of
-	// slave BMSes this is analog and status information *only*, other methods do nothing but log an error
+	// slave BMSes this is analog/status information and serial number (DIRECT only).
+	// Other methods do nothing but log an error.
 	void register_bms_count_callback_v25(std::function<void(uint8_t&)> callback) override;
 	void register_payload_count_callback_v25(std::function<void(uint8_t&)> callback) override;
 	void register_analog_information_callback_v25(std::function<void(PaceBmsProtocolV25::AnalogInformation&)> callback) override;
@@ -102,9 +106,10 @@ public:
 protected:
 	pace_bms_master::PaceBmsMaster* parent_{ nullptr };
 
-	// child sensor requested callback lists, these two are the only ones supported for a slave BMS
+	// child sensor requested callback lists; serial numbers require DIRECT polling
 	std::vector<std::function<void(PaceBmsProtocolV25::AnalogInformation&)>>                               analog_information_callbacks_v25_;
 	std::vector<std::function<void(PaceBmsProtocolV25::StatusInformation&)>>                               status_information_callbacks_v25_;
+	std::vector<std::function<void(std::string&)>>                                                       serial_number_callbacks_v25_;
 };
 
 }  // namespace pace_bms_slave

@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <sstream>
 #include <functional>
+#include <cmath>
 
 #include "esphome/core/log.h"
 #include "pace_bms_component_master.h"
@@ -46,7 +47,7 @@ void very_verbose_log_func(std::string message) {
 // helpers for printing the enums
 static const char * SlaveDiscoveryModeStrings[] = { "NONE", "RELAY", "BROADCAST", "RELAY_AND_BROADCAST" };
 const char * to_cstring(SlaveDiscoveryMode mode) { return SlaveDiscoveryModeStrings[mode]; }
-static const char * SlaveQueryModeStrings[] = { "BROADCAST", "RELAY" };
+static const char * SlaveQueryModeStrings[] = { "BROADCAST", "RELAY", "DIRECT" };
 const char * to_cstring(SlaveQueryMode mode) { return SlaveQueryModeStrings[mode]; }
 
 void PaceBmsMaster::dump_config() {
@@ -95,6 +96,8 @@ void PaceBmsMaster::setup() {
 		// the protocol en/decoder PaceBmsProtocolV25 is meant to be standalone with no dependencies, so inject esphome logging function wrappers on construction
 		this->pace_bms_v25_ = new PaceBmsProtocolV25(
 			protocol_variant_, protocol_version_, chemistry_,
+			error_log_func, warning_log_func, info_log_func, debug_log_func, verbose_log_func, very_verbose_log_func);
+		this->pace_bms_dc_ = new PaceBmsDcProtocol(protocol_version_, chemistry_,
 			error_log_func, warning_log_func, info_log_func, debug_log_func, verbose_log_func, very_verbose_log_func);
 	}
 	else if (this->protocol_commandset_ == 0x20) {
@@ -204,11 +207,12 @@ void PaceBmsMaster::update() {
 			// asking for analog info is always the first thing (here, and also in setup() if applicable) so that we can sniff the User Defined Value field to determine the protocol variant
 
 			// start analog info ====================
-			// if no slaves, or in relay (non-broadcast) mode anyway, do a direct query for this bms
-			if(this->slaves_.size() == 0 || this->slave_query_mode_ == SLAVE_QUERY_MODE_RELAY) {
+			// Without slaves, or in either per-pack mode (RELAY/DIRECT), query this BMS individually.
+			if(this->slaves_.size() == 0 || this->slave_query_mode_ != SLAVE_QUERY_MODE_BROADCAST || this->needs_online_probe()) {
 				// but only if needed
-				if (this->analog_information_callbacks_v25_.size() > 0) {
+				if (this->analog_information_callbacks_v25_.size() > 0 || this->needs_online_probe()) {
 					command_item* item = new command_item;
+					item->online_probe_target_ = this->needs_online_probe() ? this : nullptr;
 					item->description_ = std::string("read analog information (direct for master)");
 					item->create_request_frame_ = [this](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadAnalogInformationRequest(this->address_, this->address_, request); };
 					item->process_response_frame_ = [this](std::span<uint8_t>& response) -> void { this->handle_read_analog_information_response_v25(response, this); };
@@ -222,7 +226,7 @@ void PaceBmsMaster::update() {
 				bool atLeastOneSlaveAnalogInfoNeeded = false;
 				for(int slaveIndex = 0; slaveIndex < this->slaves_.size(); slaveIndex++) {
 					pace_bms_slave::PaceBmsSlave* slave = this->slaves_[slaveIndex];
-					if (slave->get_analog_information_callbacks_v25().size() > 0) {
+					if (slave->get_analog_information_callbacks_v25().size() > 0 || slave->needs_online_probe()) {
 						atLeastOneSlaveAnalogInfoNeeded = true;
 					}
 				}
@@ -235,15 +239,18 @@ void PaceBmsMaster::update() {
 					item->process_response_frame_ = [this](std::span<uint8_t>& response) -> void { this->handle_broadcast_read_analog_information_response_v25(response); };
 					read_queue_.push(item);
 				}
-				// if any slaves need analog info and we're in relay mode, do a direct query for them (master was already checked and directly queried if needed)
-				if(atLeastOneSlaveAnalogInfoNeeded && this->slave_query_mode_ == SLAVE_QUERY_MODE_RELAY) {
+				// Query each interested slave through the same queue, using RELAY or DIRECT addressing.
+				if(atLeastOneSlaveAnalogInfoNeeded && this->slave_query_mode_ != SLAVE_QUERY_MODE_BROADCAST) {
 					for(int slaveIndex = 0; slaveIndex < this->slaves_.size(); slaveIndex++) {
 						pace_bms_slave::PaceBmsSlave* slave = this->slaves_[slaveIndex];
 						// but only if needed
-						if(slave->get_analog_information_callbacks_v25().size() > 0) {
+						if(slave->get_analog_information_callbacks_v25().size() > 0 || slave->needs_online_probe()) {
 							command_item* item = new command_item;
-							item->description_ = std::string("read analog information (relay to slave address " + std::to_string(slave->get_address()) + ")");
-							item->create_request_frame_ = [this, slave](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadAnalogInformationRequest(this->address_, slave->get_address(), request); };
+							item->online_probe_target_ = slave->needs_online_probe() ? slave : nullptr;
+							item->description_ = std::string("read analog information (") +
+								(this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT ? "direct to slave address " : "relay to slave address ") +
+								std::to_string(slave->get_address()) + ")";
+							item->create_request_frame_ = [this, slave](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadAnalogInformationRequest(this->get_query_address_(slave), slave->get_address(), request); };
 							item->process_response_frame_ = [this, slave](std::span<uint8_t>& response) -> void { this->handle_read_analog_information_response_v25(response, slave); };
 							read_queue_.push(item);
 						}
@@ -253,8 +260,8 @@ void PaceBmsMaster::update() {
 			// end analog info ====================
 
 			// start status info ====================
-			// if no slaves, or in relay (non-broadcast) mode anyway, do a direct query for this bms
-			if(this->slaves_.size() == 0 || this->slave_query_mode_ == SLAVE_QUERY_MODE_RELAY) {
+			// Without slaves, or in either per-pack mode (RELAY/DIRECT), query this BMS individually.
+			if(this->slaves_.size() == 0 || this->slave_query_mode_ != SLAVE_QUERY_MODE_BROADCAST) {
 				// but only if needed
 				if (this->status_information_callbacks_v25_.size() > 0) {
 					command_item* item = new command_item;
@@ -284,16 +291,17 @@ void PaceBmsMaster::update() {
 					item->process_response_frame_ = [this](std::span<uint8_t>& response) -> void { this->handle_broadcast_read_status_information_response_v25(response); };
 					read_queue_.push(item);
 				}
-				// if any slaves need status info and we're in relay mode, do a direct query for them (master was already checked and directly queried if needed)
-				if(atLeastOneSlaveStatusInfoNeeded && this->slave_query_mode_ == SLAVE_QUERY_MODE_RELAY) {
+				// Query each interested slave through the same queue, using RELAY or DIRECT addressing.
+				if(atLeastOneSlaveStatusInfoNeeded && this->slave_query_mode_ != SLAVE_QUERY_MODE_BROADCAST) {
 					for(int slaveIndex = 0; slaveIndex < this->slaves_.size(); slaveIndex++) {
 						pace_bms_slave::PaceBmsSlave* slave = this->slaves_[slaveIndex];
 						// but only if needed
 						if(slave->get_status_information_callbacks_v25().size() > 0) {
-							pace_bms_slave::PaceBmsSlave* slave = this->slaves_[slaveIndex];
 							command_item* item = new command_item;
-							item->description_ = std::string("read status information (relay to slave address " + std::to_string(slave->get_address()) + ")");
-							item->create_request_frame_ = [this, slave](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadStatusInformationRequest(this->address_, slave->get_address(), request); };
+							item->description_ = std::string("read status information (") +
+								(this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT ? "direct to slave address " : "relay to slave address ") +
+								std::to_string(slave->get_address()) + ")";
+							item->create_request_frame_ = [this, slave](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadStatusInformationRequest(this->get_query_address_(slave), slave->get_address(), request); };
 							item->process_response_frame_ = [this, slave](std::span<uint8_t>& response) -> void { this->handle_read_status_information_response_v25(response, slave); };
 							read_queue_.push(item);
 						}
@@ -301,6 +309,17 @@ void PaceBmsMaster::update() {
 				}
 			}
 			// end status info ====================
+
+			// Vendor DC-control parameters are opt-in, per-pack reads (never aggregated).
+			for (uint8_t parameter : PaceBmsDcProtocol::PARAMETERS) {
+				if (this->needs_dc_parameter_v25(parameter))
+					this->queue_dc_read_(this, parameter);
+				if (this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT) {
+					for (auto* slave : this->slaves_)
+						if (slave->needs_dc_parameter_v25(parameter))
+							this->queue_dc_read_(slave, parameter);
+				}
+			}
 
 			if (this->hardware_version_callbacks_v25_.size() > 0) {
 				command_item* item = new command_item;
@@ -315,6 +334,18 @@ void PaceBmsMaster::update() {
 				item->create_request_frame_ = [this](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadSerialNumberRequest(this->address_, request); };
 				item->process_response_frame_ = [this](std::span<uint8_t>& response) -> void { this->handle_read_serial_number_response_v25(response); };
 				read_queue_.push(item);
+			}
+			// C2 has no relay-target payload; address each slave directly instead.
+			if (this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT) {
+				for (auto* slave : this->slaves_) {
+					if (slave->get_serial_number_callbacks_v25().empty())
+						continue;
+					command_item* item = new command_item;
+					item->description_ = "read serial number (direct to slave address " + std::to_string(slave->get_address()) + ")";
+					item->create_request_frame_ = [this, slave](std::vector<uint8_t>& request) -> bool { return this->pace_bms_v25_->CreateReadSerialNumberRequest(this->get_query_address_(slave), request); };
+					item->process_response_frame_ = [this, slave](std::span<uint8_t>& response) -> void { this->handle_read_serial_number_response_v25(response, slave); };
+					read_queue_.push(item);
+				}
 			}
 			if (this->protocols_callbacks_v25_.size() > 0) {
 				command_item* item = new command_item;
@@ -486,6 +517,12 @@ void PaceBmsMaster::update() {
 */
 
 void PaceBmsMaster::loop() {
+	// Check elapsed time even while UART work or sensor publishing is queued.
+	// Online health uses the already-supported 0x42 analog read, not T3 F5.
+	const uint32_t health_now = millis();
+	this->check_online_timeout(health_now);
+	for (auto* slave : this->slaves_) slave->check_online_timeout(health_now);
+
 	if (this->pace_bms_v25_ == nullptr &&
 		this->pace_bms_v20_ == nullptr)
 		return;
@@ -539,6 +576,9 @@ void PaceBmsMaster::loop() {
 		else {
 			ESP_LOGW(TAG, "Response frame timeout for request %s after %i ms, no valid data received", this->last_request_description.c_str(), now - this->last_receive_);
 		}
+		if (this->active_online_probe_target_ != nullptr)
+			this->active_online_probe_target_->notify_online_probe_failure(now);
+		this->active_online_probe_target_ = nullptr;
 		request_outstanding_ = false;
 		this->raw_data_index_ = 0;
 		return;
@@ -561,6 +601,9 @@ void PaceBmsMaster::loop() {
 		// is the SOI marker present at byte 0?
 		if (this->raw_data_index_ == 0 && this->raw_data_[this->raw_data_index_] != '~') {
 			ESP_LOGV(TAG, "Response frame does not begin with '~', actual: 0x%02X = '%c'", this->raw_data_[this->raw_data_index_], this->raw_data_[this->raw_data_index_]);
+			if (this->active_online_probe_target_ != nullptr)
+				this->active_online_probe_target_->notify_online_probe_failure(now);
+			this->active_online_probe_target_ = nullptr;
 			request_outstanding_ = false;
 			this->raw_data_index_ = 0;
 			return;
@@ -581,6 +624,9 @@ void PaceBmsMaster::loop() {
 			// todo: chunked log of truncated response frame
 			//ESP_LOGV(TAG, "Response frame exceeds maximum supported length, increase rx_buffer_size (recommended: 256 * number of battery packs), last request was '%s', incomplete response frame: %s", this->last_request_description.c_str(), str.c_str());
 			ESP_LOGV(TAG, "Response frame exceeds maximum supported length, increase rx_buffer_size (recommended: 256 * number of battery packs), last request was '%s'", this->last_request_description.c_str());
+			if (this->active_online_probe_target_ != nullptr)
+				this->active_online_probe_target_->notify_online_probe_failure(now);
+			this->active_online_probe_target_ = nullptr;
 			request_outstanding_ = false;
 			this->raw_data_index_ = 0;
 			return;
@@ -611,6 +657,7 @@ void PaceBmsMaster::send_next_request_frame_() {
 
 	// process_response_frame_ will call this on the next frame received
 	this->next_response_handler_ = command->process_response_frame_;
+	this->active_online_probe_target_ = command->online_probe_target_;
 	// saved for logging
 	this->last_request_description = command->description_;
 
@@ -686,6 +733,7 @@ void PaceBmsMaster::process_response_frame_(uint8_t* frame_bytes, uint16_t frame
 		next_response_handler_(response);
 	else
 		ESP_LOGE(TAG, "Response frame received but no response handler set");
+	this->active_online_probe_target_ = nullptr;
 
 	// this request/response pair is complete, any additional frames received will not be expected and should not be processed until the next command queue pop / send
 	next_response_handler_ = nullptr;
@@ -694,6 +742,68 @@ void PaceBmsMaster::process_response_frame_(uint8_t* frame_bytes, uint16_t frame
 /*
 * read/write response frame received handlers, called via next_response_handler_ from process_response_frame
 */
+
+void PaceBmsMaster::queue_dc_read_(pace_bms_base::PaceBmsBase* target, uint8_t parameter,
+                                  std::optional<uint16_t> expected_value, bool priority) {
+	command_item* item = new command_item;
+	item->description_ = "read DC parameter " + std::to_string(parameter) + " (direct address " + std::to_string(target->get_address()) + ")";
+	item->create_request_frame_ = [this, target, parameter](std::vector<uint8_t>& request) -> bool {
+		return this->pace_bms_dc_->CreateReadRequest(target->get_address(), parameter, request);
+	};
+	item->process_response_frame_ = [this, target, parameter, expected_value](std::span<uint8_t>& response) {
+		uint16_t raw;
+		if (!this->pace_bms_dc_->ProcessReadResponse(target->get_address(), this->get_query_responding_address_(target), parameter, response, raw)) {
+			ESP_LOGE(TAG, "Unable to decode DC F5 response for address %u parameter %u", target->get_address(), parameter);
+			return;
+		}
+		if (expected_value.has_value() && expected_value.value() != raw)
+			ESP_LOGW(TAG, "DC write readback mismatch at address %u parameter %u: requested raw %u, read raw %u", target->get_address(), parameter, expected_value.value(), raw);
+		target->publish_dc_parameter_v25(parameter, raw);
+	};
+	// A write ACK schedules an immediate READ before other pending writes. It uses
+	// the existing priority queue, not another UART controller or an automatic retry.
+	if (priority) this->write_queue_.push_front(item);
+	else this->read_queue_.push(item);
+}
+
+void PaceBmsMaster::queue_write_equalized_charging_current_v25(pace_bms_base::PaceBmsBase* target, float amperes) {
+	this->queue_write_dc_parameter_v25(target, PaceBmsDcProtocol::EQUALIZED_CHARGING_CURRENT, amperes);
+}
+
+void PaceBmsMaster::queue_write_dc_parameter_v25(pace_bms_base::PaceBmsBase* target, uint8_t parameter, float value) {
+	const bool known_slave = std::any_of(this->slaves_.begin(), this->slaves_.end(),
+		[target](auto* slave) { return slave == target; });
+	if (this->pace_bms_dc_ == nullptr ||
+		(target != this && (this->slave_query_mode_ != SLAVE_QUERY_MODE_DIRECT || !known_slave))) {
+		ESP_LOGE(TAG, "DC writes require protocol v25 and DIRECT mode for slaves");
+		return;
+	}
+	const float scaled = value * PaceBmsDcProtocol::ValueScale(parameter);
+	if (!PaceBmsDcProtocol::IsSupportedParameter(parameter) || !std::isfinite(value) || value < 0.0f ||
+		scaled > PaceBmsDcProtocol::MaxWriteRaw(parameter) ||
+		std::fabs(scaled - std::round(scaled)) > 0.005f) {
+		ESP_LOGE(TAG, "DC value outside permitted bounds or not on a valid step (parameter %u)", parameter);
+		return;
+	}
+	if (!target->has_dc_parameter_value_v25(parameter)) {
+		ESP_LOGE(TAG, "Read DC parameter %u successfully before writing it", parameter);
+		return;
+	}
+	const uint16_t raw = static_cast<uint16_t>(std::round(scaled));
+	command_item* item = new command_item;
+	item->description_ = "write DC parameter " + std::to_string(parameter) + " (direct address " + std::to_string(target->get_address()) + ")";
+	item->create_request_frame_ = [this, target, parameter, raw](std::vector<uint8_t>& request) -> bool {
+		return this->pace_bms_dc_->CreateWriteRequest(target->get_address(), parameter, raw, request);
+	};
+	item->process_response_frame_ = [this, target, parameter, raw](std::span<uint8_t>& response) {
+		if (!this->pace_bms_dc_->ProcessWriteResponse(target->get_address(), this->get_query_responding_address_(target), response)) {
+			ESP_LOGE(TAG, "DC parameter %u write failed at address %u; no optimistic state published", parameter, target->get_address());
+			return;
+		}
+		this->queue_dc_read_(target, parameter, raw, true);
+	};
+	this->write_queue_push_back_with_deduplication(item);
+}
 
 void PaceBmsMaster::handle_read_bms_count_response_v25(std::span<uint8_t>& response) {
 	ESP_LOGD(TAG, "Processing '%s' response", this->last_request_description.c_str());
@@ -809,11 +919,13 @@ void PaceBmsMaster::handle_read_analog_information_response_v25(std::span<uint8_
 	};
 
 	// note that we're executing a callback but it is syncronous
-	bool result = this->pace_bms_v25_->ProcessReadAnalogInformationResponse(this->address_, target->get_address(), this->responding_address_, response, onPayload);
+	bool result = this->pace_bms_v25_->ProcessReadAnalogInformationResponse(this->get_query_address_(target), target->get_address(), this->get_query_responding_address_(target), response, onPayload);
 	if (result == false) {
+		if (target->needs_online_probe()) target->notify_online_probe_failure(millis());
 		ESP_LOGE(TAG, "Unable to decode '%s' response", this->last_request_description.c_str());
 		return;
 	}
+	if (target->needs_online_probe()) target->notify_online_probe_success(millis());
 }
 
 void PaceBmsMaster::handle_read_status_information_response_v25(std::span<uint8_t>& response, pace_bms_base::PaceBmsBase* target) {
@@ -827,7 +939,7 @@ void PaceBmsMaster::handle_read_status_information_response_v25(std::span<uint8_
 	};
 
 	// note that we're executing a callback but it is syncronous
-	bool result = this->pace_bms_v25_->ProcessReadStatusInformationResponse(this->address_, target->get_address(), this->responding_address_, response, onPayload);
+	bool result = this->pace_bms_v25_->ProcessReadStatusInformationResponse(this->get_query_address_(target), target->get_address(), this->get_query_responding_address_(target), response, onPayload);
 	if (result == false) {
 		ESP_LOGE(TAG, "Unable to decode '%s' response", this->last_request_description.c_str());
 		return;
@@ -945,19 +1057,21 @@ void PaceBmsMaster::handle_read_hardware_version_response_v25(std::span<uint8_t>
 	}
 }
 
-void PaceBmsMaster::handle_read_serial_number_response_v25(std::span<uint8_t>& response) {
+void PaceBmsMaster::handle_read_serial_number_response_v25(std::span<uint8_t>& response, pace_bms_slave::PaceBmsSlave* target) {
 	ESP_LOGD(TAG, "Processing '%s' response", this->last_request_description.c_str());
 
+	pace_bms_base::PaceBmsBase* addressed_bms = target != nullptr ? static_cast<pace_bms_base::PaceBmsBase*>(target) : this;
 	std::string serial_number;
-	bool result = this->pace_bms_v25_->ProcessReadSerialNumberResponse(this->address_, this->responding_address_, response, serial_number);
+	bool result = this->pace_bms_v25_->ProcessReadSerialNumberResponse(this->get_query_address_(addressed_bms), this->get_query_responding_address_(addressed_bms), response, serial_number);
 	if (result == false) {
 		ESP_LOGE(TAG, "Unable to decode '%s' response", this->last_request_description.c_str());
 		return;
 	}
 
-	// dispatch to any child components that registered for a callback with us
-	for (int i = 0; i < this->serial_number_callbacks_v25_.size(); i++) {
-		serial_number_callbacks_v25_[i](serial_number);
+	// Publish only to the pack addressed by this queued request.
+	const auto& callbacks = target != nullptr ? target->get_serial_number_callbacks_v25() : this->serial_number_callbacks_v25_;
+	for (const auto& callback : callbacks) {
+		callback(serial_number);
 	}
 }
 

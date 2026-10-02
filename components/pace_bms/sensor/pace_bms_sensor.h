@@ -12,8 +12,12 @@ class PaceBmsSensor : public Component {
 protected:
 	static const int MAX_CELL_COUNT = 16;
 	static const int MAX_TEMP_COUNT = 8;
+	sensor::Sensor* bus_current_sensor_{ nullptr };
+	sensor::Sensor* equalized_charging_current_sensor_{ nullptr };
 public:
 	void set_parent(PaceBmsBase* parent) { parent_ = parent; }
+	void set_bus_current_sensor(sensor::Sensor* sens) { bus_current_sensor_ = sens; }
+	void set_equalized_charging_current_sensor(sensor::Sensor* sens) { equalized_charging_current_sensor_ = sens; }
 
 	void set_bms_count_sensor(sensor::Sensor* sens) { bms_count_sensor_ = sens; }
 	void set_payload_count_sensor(sensor::Sensor* sens) { payload_count_sensor_ = sens; }

@@ -11,6 +11,16 @@ static const char* const TAG = "pace_bms_base.sensor";
 
 void PaceBmsSensor::setup() {
 	if (this->parent_->get_protocol_commandset() == 0x25) {
+		if (this->bus_current_sensor_ != nullptr) {
+			this->parent_->register_dc_parameter_callback_v25(PaceBmsDcProtocol::BUS_CURRENT, [this](float amperes) {
+				this->parent_->queue_sensor_update([this, amperes]() { this->bus_current_sensor_->publish_state(amperes); });
+			});
+		}
+		if (this->equalized_charging_current_sensor_ != nullptr) {
+			this->parent_->register_dc_parameter_callback_v25(PaceBmsDcProtocol::EQUALIZED_CHARGING_CURRENT, [this](float amperes) {
+				this->parent_->queue_sensor_update([this, amperes]() { this->equalized_charging_current_sensor_->publish_state(amperes); });
+			});
+		}
 		if (request_analog_info_callback_ == true) {
 			this->parent_->register_analog_information_callback_v25([this](PaceBmsProtocolV25::AnalogInformation& analog_information) { this->analog_information_callback_v25(analog_information); });
 		}
@@ -55,6 +65,8 @@ void PaceBmsSensor::setup() {
 
 void PaceBmsSensor::dump_config() {
 	ESP_LOGCONFIG(TAG, "pace_bms_sensor:");
+	LOG_SENSOR("  ", "Bus Current Setting", this->bus_current_sensor_);
+	LOG_SENSOR("  ", "Equalized Charging Current Setting", this->equalized_charging_current_sensor_);
 	LOG_SENSOR("  ", "Cell Count", this->cell_count_sensor_);
 	for (int i = 0; i < MAX_CELL_COUNT; i++)
 		LOG_SENSOR("  ", "Cell Voltage X of 16", this->cell_voltage_sensor_[i]);

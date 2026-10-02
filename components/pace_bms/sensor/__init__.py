@@ -84,6 +84,8 @@ TEMPERATURES = [
     CONF_TEMPERATURE_08,
 ]
 CONF_CURRENT = "current"
+CONF_BUS_CURRENT = "bus_current"
+CONF_EQUALIZED_CHARGING_CURRENT = "equalized_charging_current"
 CONF_TOTAL_VOLTAGE = "total_voltage"
 CONF_REMAINING_CAPACITY = "remaining_capacity"
 CONF_FULL_CAPACITY = "full_capacity"
@@ -195,6 +197,15 @@ CONFIG_SCHEMA = cv.All(
         cv.GenerateID(): cv.declare_id(PaceBmsSensor),
         cv.GenerateID(CONF_PACE_BMS_ID): cv.use_id(PaceBmsBase),
         cv.Optional(CONF_DEVICE_ID): cv.sub_device_id,
+
+        cv.Optional(CONF_BUS_CURRENT): sensor.sensor_schema(
+            unit_of_measurement=UNIT_AMPERE, accuracy_decimals=1,
+            device_class=DEVICE_CLASS_CURRENT,
+        ),
+        cv.Optional(CONF_EQUALIZED_CHARGING_CURRENT): sensor.sensor_schema(
+            unit_of_measurement=UNIT_AMPERE, accuracy_decimals=1,
+            device_class=DEVICE_CLASS_CURRENT,
+        ),
 
         cv.Optional(CONF_BMS_COUNT): sensor.sensor_schema(
             #unit_of_measurement=,
@@ -787,6 +798,13 @@ async def to_code(config):
 
     parent = await cg.get_variable(config[CONF_PACE_BMS_ID])
     cg.add(var.set_parent(parent))
+
+    if conf := config.get(CONF_BUS_CURRENT):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_bus_current_sensor(sens))
+    if conf := config.get(CONF_EQUALIZED_CHARGING_CURRENT):
+        sens = await sensor.new_sensor(conf)
+        cg.add(var.set_equalized_charging_current_sensor(sens))
 
 
     if bms_count_config := config.get(CONF_BMS_COUNT):

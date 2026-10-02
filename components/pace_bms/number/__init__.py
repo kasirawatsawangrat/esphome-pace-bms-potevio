@@ -1,19 +1,24 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
+import math
 from esphome.components import number
 from esphome.components.number import NUMBER_MODES
 from esphome.const import (
     CONF_ID,
     CONF_DEVICE_ID,
     CONF_MODE,
+    CONF_MIN_VALUE,
+    CONF_MAX_VALUE,
     DEVICE_CLASS_VOLTAGE,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_CURRENT,
+    DEVICE_CLASS_POWER,
     DEVICE_CLASS_BATTERY,
     DEVICE_CLASS_TEMPERATURE,
     UNIT_VOLT,
     UNIT_SECOND,
     UNIT_AMPERE,
+    UNIT_WATT,
     UNIT_MILLISECOND,
     UNIT_MINUTE,
     UNIT_PERCENT,
@@ -28,6 +33,26 @@ DEPENDENCIES = ["pace_bms"]
 
 PaceBmsNumber = pace_bms_base_ns.class_("PaceBmsNumber", cg.Component)
 PaceBmsNumberImplementation = pace_bms_base_ns.class_("PaceBmsNumberImplementation", cg.Component, number.Number)
+PaceBmsDcCurrentNumber = pace_bms_base_ns.class_("PaceBmsDcCurrentNumber", number.Number, cg.Component)
+CONF_EQUALIZED_CHARGING_CURRENT = "equalized_charging_current"
+DC_NUMBERS = {
+    "bus_current": (0x07, 100.0, 0.1, UNIT_AMPERE, DEVICE_CLASS_CURRENT),
+    CONF_EQUALIZED_CHARGING_CURRENT: (0x0A, 100.0, 0.1, UNIT_AMPERE, DEVICE_CLASS_CURRENT),
+    "discharge_power": (0x0B, 4800.0, 1.0, UNIT_WATT, DEVICE_CLASS_POWER),
+    "charge_power": (0x0C, 4800.0, 1.0, UNIT_WATT, DEVICE_CLASS_POWER),
+}
+
+
+def validate_dc_current_range(config, limit=100.0, step=0.1):
+    minimum = config[CONF_MIN_VALUE]
+    maximum = config[CONF_MAX_VALUE]
+    if not (math.isfinite(minimum) and math.isfinite(maximum) and
+            0 <= minimum < maximum <= limit):
+        raise cv.Invalid(f"DC number limits must satisfy 0 <= min_value < max_value <= {limit}.")
+    for value in (minimum, maximum):
+        if abs(value / step - round(value / step)) > 0.00001:
+            raise cv.Invalid(f"DC number limits must use {step} increments.")
+    return config
 
 NUMBER_MODE_BOX = "BOX"
 
@@ -108,6 +133,23 @@ CONFIG_SCHEMA = cv.All(
         cv.GenerateID(): cv.declare_id(PaceBmsNumber),
         cv.GenerateID(CONF_PACE_BMS_ID): cv.use_id(PaceBmsBase),
         cv.Optional(CONF_DEVICE_ID): cv.sub_device_id,
+
+        **{
+            cv.Optional(key): cv.All(
+                number.number_schema(
+                    PaceBmsDcCurrentNumber,
+                    device_class=device_class,
+                    unit_of_measurement=unit,
+                    entity_category=ENTITY_CATEGORY_CONFIG,
+                ).extend(cv.COMPONENT_SCHEMA).extend({
+                    cv.Optional(CONF_MODE, default=NUMBER_MODE_BOX): cv.enum(NUMBER_MODES, upper=True),
+                    cv.Optional(CONF_MIN_VALUE, default=0): cv.float_range(min=0, max=maximum),
+                    cv.Optional(CONF_MAX_VALUE, default=maximum): cv.float_range(min=0, max=maximum),
+                }),
+                lambda conf, limit=maximum, increment=step: validate_dc_current_range(conf, limit, increment),
+            )
+            for key, (parameter, maximum, step, unit, device_class) in DC_NUMBERS.items()
+        },
 
         cv.Optional(CONF_CELL_OVER_VOLTAGE_ALARM): number.number_schema(
             PaceBmsNumberImplementation,
@@ -452,6 +494,14 @@ async def to_code(config):
 
     parent = await cg.get_variable(config[CONF_PACE_BMS_ID])
     cg.add(var.set_parent(parent))
+
+    for key, (parameter, maximum, step, unit, device_class) in DC_NUMBERS.items():
+        if conf := config.get(key):
+            num = await number.new_number(conf, min_value=conf[CONF_MIN_VALUE],
+                                          max_value=conf[CONF_MAX_VALUE], step=step)
+            await cg.register_component(num, conf)
+            cg.add(num.set_parent(parent))
+            cg.add(num.set_parameter(parameter))
 
     if cell_over_voltage_alarm_config := config.get(CONF_CELL_OVER_VOLTAGE_ALARM):
         num = await number.new_number(

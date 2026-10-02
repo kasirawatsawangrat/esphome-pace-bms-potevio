@@ -45,16 +45,24 @@ int PaceBmsSlave::get_protocol_commandset() { return this->parent_->get_protocol
 // we don't push all updates in a single loop, that'd stall the ESP out
 void PaceBmsSlave::queue_sensor_update(std::function<void()> update) { this->parent_->queue_sensor_update(update); }
 
+void PaceBmsSlave::write_equalized_charging_current_v25(float amperes) {
+	this->parent_->queue_write_equalized_charging_current_v25(this, amperes);
+}
+
+void PaceBmsSlave::write_dc_parameter_v25(uint8_t parameter, float value) {
+	this->parent_->queue_write_dc_parameter_v25(this, parameter, value);
+}
+
 // child sensors call these to register for notification upon reciept of various types of data from the BMS, and the 
 //     callbacks lists not being empty is what prompts update() to queue command_items for BMS communication in order to 
 //     periodically gather these updates for fan-out to the sensors the first place
 void PaceBmsSlave::register_bms_count_callback_v25(std::function<void(uint8_t&)> callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
 void PaceBmsSlave::register_payload_count_callback_v25(std::function<void(uint8_t&)> callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
-// these are the ONLY TWO IMPLEMENTED CALLBACKS for slaves
+// Analog/status callbacks work in all query modes; serial numbers require DIRECT.
 void PaceBmsSlave::register_analog_information_callback_v25(std::function<void(PaceBmsProtocolV25::AnalogInformation&)> callback) { analog_information_callbacks_v25_.push_back(std::move(callback)); }
 void PaceBmsSlave::register_status_information_callback_v25(std::function<void(PaceBmsProtocolV25::StatusInformation&)> callback) { status_information_callbacks_v25_.push_back(std::move(callback)); }
 void PaceBmsSlave::register_hardware_version_callback_v25(std::function<void(std::string&)> callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
-void PaceBmsSlave::register_serial_number_callback_v25(std::function<void(std::string&) > callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
+void PaceBmsSlave::register_serial_number_callback_v25(std::function<void(std::string&) > callback) { serial_number_callbacks_v25_.push_back(std::move(callback)); }
 void PaceBmsSlave::register_protocols_callback_v25(std::function<void(PaceBmsProtocolV25::Protocols&) > callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
 void PaceBmsSlave::register_cell_over_voltage_configuration_callback_v25(std::function<void(PaceBmsProtocolV25::CellOverVoltageConfiguration&)> callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }
 void PaceBmsSlave::register_pack_over_voltage_configuration_callback_v25(std::function<void(PaceBmsProtocolV25::PackOverVoltageConfiguration&)> callback) { ESP_LOGE(TAG, "non-analog/status information commands not available for slave devices"); }

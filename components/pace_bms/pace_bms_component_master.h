@@ -18,6 +18,7 @@ enum SlaveDiscoveryMode : uint8_t {
 enum SlaveQueryMode : uint8_t {
 	SLAVE_QUERY_MODE_BROADCAST = 0,
 	SLAVE_QUERY_MODE_RELAY = 1,
+	SLAVE_QUERY_MODE_DIRECT = 2,
 };
 
 // this class encapsulates an instance of PaceBmsProtocolV25 (which handles protocol version 0x25) and injects the logging dependencies into it
@@ -36,6 +37,14 @@ public:
 	void set_slave_discovery_mode(SlaveDiscoveryMode mode) { this->slave_discovery_mode_ = mode; }
 	void set_slave_query_mode(SlaveQueryMode mode) { this->slave_query_mode_ = mode; }
 	void set_rx_buffer_size(uint16_t rx_buffer_size) { this->rx_buffer_size_ = rx_buffer_size; }
+	void write_equalized_charging_current_v25(float amperes) override {
+		queue_write_equalized_charging_current_v25(this, amperes);
+	}
+	void queue_write_equalized_charging_current_v25(pace_bms_base::PaceBmsBase* target, float amperes);
+	void write_dc_parameter_v25(uint8_t parameter, float value) override {
+		queue_write_dc_parameter_v25(this, parameter, value);
+	}
+	void queue_write_dc_parameter_v25(pace_bms_base::PaceBmsBase* target, uint8_t parameter, float value);
 
 	// currently the master will dispatch BMS updates to slaves (or itself) through these two access points, could probably use an improved / cleaner 
 	// design such as having slaves (or itself) process the payloads internally via a method such as "notify_analog_information" for example
@@ -143,6 +152,20 @@ protected:
 
 	SlaveDiscoveryMode slave_discovery_mode_{ SLAVE_DISCOVERY_MODE_NONE };
 	SlaveQueryMode slave_query_mode_{ SLAVE_QUERY_MODE_BROADCAST };
+	PaceBmsDcProtocol* pace_bms_dc_{ nullptr };
+	void queue_dc_read_(pace_bms_base::PaceBmsBase* target, uint8_t parameter,
+	                    std::optional<uint16_t> expected_value = std::nullopt, bool priority = false);
+
+	// DIRECT uses each pack's own header address, while RELAY goes via the master.
+	uint8_t get_query_address_(const pace_bms_base::PaceBmsBase* target) const {
+		return this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT ? target->get_address() : this->address_;
+	}
+	std::optional<uint8_t> get_query_responding_address_(const pace_bms_base::PaceBmsBase* target) const {
+		// The master's response-address override must not accept its replies for a direct slave request.
+		if (this->slave_query_mode_ == SLAVE_QUERY_MODE_DIRECT && target != this)
+			return std::nullopt;
+		return this->responding_address_;
+	}
 
 	// put into command_item as a pointer to handle the BMS response
 	void handle_read_bms_count_response_v25(std::span<uint8_t>& response);
@@ -155,7 +178,7 @@ protected:
 	void handle_broadcast_read_analog_information_response_v25(std::span<uint8_t>& response);
 	void handle_broadcast_read_status_information_response_v25(std::span<uint8_t>& response);
 	void handle_read_hardware_version_response_v25(std::span<uint8_t>& response);
-	void handle_read_serial_number_response_v25(std::span<uint8_t>& response);
+	void handle_read_serial_number_response_v25(std::span<uint8_t>& response, pace_bms_slave::PaceBmsSlave* target = nullptr);
 	void handle_write_switch_command_response_v25(PaceBmsProtocolV25::SwitchCommand, std::span<uint8_t>& response);
 	void handle_write_mosfet_switch_command_response_v25(PaceBmsProtocolV25::MosfetType type, PaceBmsProtocolV25::MosfetState state, std::span<uint8_t>& response);
 	void handle_write_shutdown_command_response_v25(std::span<uint8_t>& response);
@@ -243,6 +266,7 @@ protected:
 		std::string description_;
 		std::function<bool(std::vector<uint8_t>&)> create_request_frame_;
 		std::function<void(std::span<uint8_t>&)> process_response_frame_;
+		pace_bms_base::PaceBmsBase* online_probe_target_{nullptr};
 	};
 	// when the bus is clear:
 	//     the next command_item will be popped from either the read or the write queue (writes always take priority)
@@ -257,6 +281,7 @@ protected:
 	std::queue<command_item*> read_queue_;
 	std::list<command_item*> write_queue_;
 	std::function<void(std::span<uint8_t>&)> next_response_handler_ = nullptr;
+	pace_bms_base::PaceBmsBase* active_online_probe_target_{nullptr};
 	std::string last_request_description;
 
 	// list of slaves that have registered with us

@@ -75,6 +75,64 @@ bool PaceBmsProtocolV25::CreateReadAnalogInformationRequest(const uint8_t busId,
 
 	return true;
 }
+// Sizes here are ASCII hex characters (two characters per decoded byte).
+// Preflight every record before publishing anything, so counts cannot move reads
+// into the checksum or publish structurally truncated broadcast responses.
+bool PaceBmsProtocolV25::ValidateInformationRecords(
+    const std::span<uint8_t>& response, uint16_t recordOffset, int16_t payloadLen,
+    uint8_t payloadCount, bool analog, std::vector<Protocol25Variant*>& variants,
+    std::vector<uint8_t>& temperatureCounts, bool quietMode)
+{
+	const uint16_t payloadEnd = PAYLOAD_START_OFFSET + payloadLen;
+	auto fail = [this, quietMode](std::string message) {
+		if (quietMode) LogVeryVerbose("QuietMode: " + message);
+		else LogError(message);
+		return false;
+	};
+	for (uint8_t index = 0; index < payloadCount; ++index) {
+		if (recordOffset + 2 > payloadEnd)
+			return fail("Information response is missing a cell count");
+		uint16_t snoopOffset = recordOffset;
+		const uint8_t cells = ReadHexEncodedByte(response, snoopOffset, quietMode);
+		if (cells == 0 || cells > MAX_CELL_COUNT)
+			return fail("Information response cell count is outside the supported range 1-16");
+		const uint16_t temperatureOffset = recordOffset + 2 + cells * (analog ? 4 : 2);
+		if (temperatureOffset + 2 > payloadEnd)
+			return fail("Information response is truncated before its temperature count");
+		snoopOffset = temperatureOffset;
+		const uint8_t temperatures = ReadHexEncodedByte(response, snoopOffset, quietMode);
+		if (temperatures == 0 || temperatures > MAX_TEMP_COUNT)
+			return fail("Information response temperature count is outside the supported range 1-8");
+		Protocol25Variant* variant = currentProtocolVariant;
+		if (analog) {
+			const uint16_t userValueOffset = temperatureOffset + 2 + temperatures * 4 + 12;
+			if (userValueOffset + 2 > payloadEnd)
+				return fail("AnalogInformation response is truncated before its variant value");
+			snoopOffset = userValueOffset;
+			const uint8_t userValue = ReadHexEncodedByte(response, snoopOffset, quietMode);
+			// Potevio P15S100A: value 4, six temperatures, one extra
+			// decoded byte. Sunsynk also uses value 4 but eight temperatures.
+			variant = (userValue == 4 && temperatures == 6)
+			    ? &potevioProtocolVariant : GetProtocolVariantInfo(userValue);
+			if (variant == nullptr) {
+				if (!quietMode) LogWarning("Unknown AnalogInformation variant " + std::to_string(userValue) + "; using the standard layout");
+				variant = GetProtocolVariantInfo(3);
+			}
+		}
+		const uint16_t recordLength = analog
+		    ? 30 + cells * 4 + temperatures * 4 + variant->analogInformationTrailingBytes
+		    : 28 + cells * 2 + temperatures * 2 + variant->statusInformationTrailingBytes;
+		if (recordOffset + recordLength > payloadEnd)
+			return fail("Information response is shorter than its cell/temperature counts and variant require");
+		variants.push_back(variant);
+		temperatureCounts.push_back(temperatures);
+		recordOffset += recordLength;
+	}
+	if (recordOffset != payloadEnd)
+		return fail("Information response payload length does not match its cell/temperature counts and variant");
+	return true;
+}
+
 bool PaceBmsProtocolV25::ProcessReadAnalogInformationResponse(const uint8_t busId, const uint8_t targetedBusId, std::optional<uint8_t> respondingBusId, const std::span<uint8_t>& response, std::function<void(uint8_t payloadCount, uint8_t index, AnalogInformation& payload)> onPayload, bool quietMode)
 {
 	//std::memset(&analogInformation, 0, sizeof(AnalogInformation));
@@ -107,35 +165,11 @@ bool PaceBmsProtocolV25::ProcessReadAnalogInformationResponse(const uint8_t busI
 	//	return false;
 	//}
 
-	if(payloadLen < MINIMUM_ANALOG_INFORMATION_PAYLOAD_SIZE)
-	{
-		logError("Sanity Check: AnalogInformation response payload length too short, must be at least " + std::to_string(MINIMUM_ANALOG_INFORMATION_PAYLOAD_SIZE) + " bytes but got " + std::to_string(payloadLen) + " bytes");
+	// Four ASCII bytes cover the reserved byte and address/payload count.
+	// Record sizes are checked below using the cell and temperature counts.
+	if (payloadLen < 4) {
+		logError("AnalogInformation response is missing its payload header");
 		return false;
-	}
-
-	// first thing we need to do is look ahead and check the AnalogInformation UserDefinedValue, which tells us how to interpret the rest of the payload
-	// but before we can do that, we first need to figure out how many temperature readings are present since that changes the offset to the UserDefinedValue
-	// todo: should handle cell count dynamically for look-ahead here as well, but there are currently no known variants with a cell count other than 16, 
-	//       note that this would also offset the temperature count lookahead... if someone submits logs for such a variant I will implement that, but don't 
-	//       see a need to complicate things right now other than general principle
-	uint16_t snoopOffset = PAYLOAD_START_OFFSET + 70; // 83
-	uint8_t lookAhead_TemperatureCount = ReadHexEncodedByte(response, snoopOffset, quietMode);
-	if(lookAhead_TemperatureCount != 6 && lookAhead_TemperatureCount != 8)
-	{
-		logWarning("lookAhead: AnalogInformation response contains a temperature count of " + std::to_string(lookAhead_TemperatureCount) + " which is not one of the expected values of 6 or 8. This will be ignored, but please file an issue report with full logs at VERY_VERBOSE level.");
-	}
-	// calculate offset to the UserDefinedValue based on the temperature count
-	// the normal temperature count is 6, but Eenovance/Sunsynk have 8 temperature readings so the offset is advanced by an extra 8 bytes, gotta love that vendor lock in!
-	snoopOffset = PAYLOAD_START_OFFSET + 84 + (lookAhead_TemperatureCount * 4); // 121 for 6 temps, or, 129 for 8 temps
-	uint8_t lookAhead_AnalogInformationUserDefinedValue = ReadHexEncodedByte(response, snoopOffset, quietMode);
-	currentProtocolVariant = GetProtocolVariantInfo(lookAhead_AnalogInformationUserDefinedValue);
-	bool using_default_fallback_variant = false;
-	if(currentProtocolVariant == nullptr)
-	{
-		logWarning("lookAhead: Response contains a constant with an unexpected value '" + std::to_string(lookAhead_AnalogInformationUserDefinedValue) + "' this may be an incorrect protocol variant. This will be ignored, but please file an issue report with full logs at VERY_VERBOSE level.");
-		// we can still try to parse the rest of the response, just assume the "standard" variant
-		currentProtocolVariant = GetProtocolVariantInfo(3);
-		using_default_fallback_variant = true;
 	}
 
 	// payload starts here, everything else was validated by the initial call to ValidateResponseAndGetPayloadLength
@@ -172,23 +206,6 @@ bool PaceBmsProtocolV25::ProcessReadAnalogInformationResponse(const uint8_t busI
 			error = true;
 		}
 
-		// sanity check - payload length should be a multiple of the expected single-payload size
-		int remainder = (payloadLen - 4 /* initial zero byte plus payload len byte */) % ((118 /* standard analog info payload size */ + currentProtocolVariant->analogInformationTotalExtraBytes));
-		if(remainder != 0)
-		{
-			logError("Response to AnalogInformation broadcast request contains a total payload length that is not a multiple of the expected payload size, remainder " + std::to_string(remainder) + " bytes.");
-			error = true;
-		}
-
-		// sanity check - payload count should match total payload length divided by expected single-payload size
-		// in case of a mismatch, use the calculated value instead of the provided value
-		int calculatedPayloadCount = (payloadLen - 4 /* initial zero byte plus payload len byte */) / ((118 /* standard analog info payload size */ + currentProtocolVariant->analogInformationTotalExtraBytes));
-		if(calculatedPayloadCount != payloadCount)
-		{
-			logWarning("Response to AnalogInformation broadcast request contains a payload count of " + std::to_string(payloadCount) + " but the total payload length indicates " + std::to_string(calculatedPayloadCount) + " payloads are present; using calculated value");
-			payloadCount = calculatedPayloadCount;
-		}
-
 		if(error)
 		{
 			return false;
@@ -198,8 +215,16 @@ bool PaceBmsProtocolV25::ProcessReadAnalogInformationResponse(const uint8_t busI
 	logVeryVerbose(std::to_string(payloadCount) + " responses found in analog information payload");
 #endif
 
+	std::vector<Protocol25Variant*> recordVariants;
+	std::vector<uint8_t> recordTemperatureCounts;
+	if (!ValidateInformationRecords(response, byteOffset, payloadLen, payloadCount, true,
+	                                recordVariants, recordTemperatureCounts, quietMode))
+		return false;
+
 	for(int index = 0; index < payloadCount; index++)
 	{
+		currentProtocolVariant = recordVariants[index];
+		const uint8_t lookAhead_TemperatureCount = recordTemperatureCounts[index];
 		AnalogInformation analogInformation;
 		//std::memset(&analogInformation, 0, sizeof(AnalogInformation));
 
@@ -255,7 +280,7 @@ bool PaceBmsProtocolV25::ProcessReadAnalogInformationResponse(const uint8_t busI
 
 		uint8_t again_AnalogInformationUserDefinedValue = ReadHexEncodedByte(response, byteOffset, quietMode);
 		if (again_AnalogInformationUserDefinedValue != currentProtocolVariant->analogInformationUserDefinedValue &&
-		    using_default_fallback_variant == false)
+		    GetProtocolVariantInfo(again_AnalogInformationUserDefinedValue) != nullptr)
 		{
 			logError("AnalogInformation UserDefinedValue lookahead mismatch, this is a bug in PACE_BMS. Please file an issue report with full logs at VERY_VERBOSE level.");
 			return false;
@@ -682,9 +707,9 @@ bool PaceBmsProtocolV25::ProcessReadStatusInformationResponse(const uint8_t busI
 	//	return false;
 	//}
 
-	if(payloadLen < 76)
+	if(payloadLen < 4)
 	{
-		logError("Sanity Check: StatusInformation response payload length too short, must be at least 76 bytes but got " + std::to_string(payloadLen) + " bytes");
+		logError("StatusInformation response is missing its payload header");
 		return false;
 	}
 
@@ -723,20 +748,6 @@ bool PaceBmsProtocolV25::ProcessReadStatusInformationResponse(const uint8_t busI
 			error = true;
 		}
 
-		int remainder = (payloadLen - 4 /* initial zero byte plus payload len byte */) % ((72 /* standard status info payload size */ + currentProtocolVariant->statusInformationTotalExtraBytes));
-		if(remainder != 0)
-		{
-			logError("Response to StatusInformation broadcast request contains a total payload length that is not a multiple of the expected payload size, remainder " + std::to_string(remainder) + " bytes.");
-			error = true;
-		}
-
-		int calculatedPayloadCount = (payloadLen - 4 /* initial zero byte plus payload len byte */) / ((72 /* standard status info payload size */ + currentProtocolVariant->statusInformationTotalExtraBytes));
-		if(calculatedPayloadCount != payloadCount)
-		{
-			logWarning("Response to StatusInformation broadcast request contains a payload count of " + std::to_string(payloadCount) + " but the total payload length indicates " + std::to_string(calculatedPayloadCount) + " payloads are present; using calculated value");
-			payloadCount = calculatedPayloadCount;
-		}
-
 		if(error)
 		{
 			return false;
@@ -745,6 +756,12 @@ bool PaceBmsProtocolV25::ProcessReadStatusInformationResponse(const uint8_t busI
 #if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERY_VERBOSE
 	logVeryVerbose(std::to_string(payloadCount) + " responses found in status information payload");
 #endif
+
+	std::vector<Protocol25Variant*> recordVariants;
+	std::vector<uint8_t> recordTemperatureCounts;
+	if (!ValidateInformationRecords(response, byteOffset, payloadLen, payloadCount, false,
+	                                recordVariants, recordTemperatureCounts, quietMode))
+		return false;
 
 	for(int index = 0; index < payloadCount; index++)
 	{
@@ -893,7 +910,7 @@ bool PaceBmsProtocolV25::ProcessReadStatusInformationResponse(const uint8_t busI
 		}
 
 		uint8_t warnState2 = ReadHexEncodedByte(response, byteOffset, quietMode);
-		statusInformation.warning_value2 = warnState1;
+		statusInformation.warning_value2 = warnState2;
 		if (warnState2 != 0)
 		{
 			statusInformation.warningText.append(DecodeWarningStatus2Value(warnState2));

@@ -2,7 +2,6 @@
 
 #include "pace_bms_protocol_base.h"
 
-const uint8_t MINIMUM_ANALOG_INFORMATION_PAYLOAD_SIZE = 122; // UserDefinedValue = 3, the baseline PACE firmware version
 
 class PaceBmsProtocolV25 : public PaceBmsProtocolBase
 {
@@ -150,6 +149,15 @@ protected:
 			6,  // statusInformationTotalExtraBytes
 		},
 	};
+
+	// Observed Potevio value-4 layout with six temperature readings.
+	// Extension content is not yet documented; skip its one decoded byte.
+	Protocol25Variant potevioProtocolVariant{4, 2, 0, 2, 0};
+
+	bool ValidateInformationRecords(const std::span<uint8_t>& response, uint16_t recordOffset,
+	                                int16_t payloadLen, uint8_t payloadCount, bool analog,
+	                                std::vector<Protocol25Variant*>& variants,
+	                                std::vector<uint8_t>& temperatureCounts, bool quietMode);
 
 	// default is the "standard" protocol variant
 	Protocol25Variant* currentProtocolVariant = &protocol25VariantInfo[0];
